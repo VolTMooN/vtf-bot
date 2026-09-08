@@ -3,16 +3,20 @@ import io
 import sqlite3
 from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, F, types
+from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-# СЮДА ВСТАВЬ СВОЙ ТОКЕН НИЖЕ В КАВЫЧКАХ:
+# ВСТАВЬ СВОЙ ТОКЕН НИЖЕ:
 TOKEN = "8565247399:AAEE7PL2e6J-iHK84nuBcD3mtSSfSPYZvaA"
 
-bot = Bot(token=TOKEN)
+# Прокси для бесплатного аккаунта PythonAnywhere
+session = AiohttpSession(proxy="http://proxy.server:3128")
+
+bot = Bot(token=TOKEN, session=session)
 dp = Dispatcher(storage=MemoryStorage())
 
 CLOSE_HOUR = 17
