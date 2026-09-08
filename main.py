@@ -1,5 +1,4 @@
 import asyncio
-import io
 import sqlite3
 from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, F, types
@@ -10,18 +9,17 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-# ВСТАВЬ СВОЙ ТОКЕН НИЖЕ:
 TOKEN = "8565247399:AAEE7PL2e6J-iHK84nuBcD3mtSSfSPYZvaA"
 
-# Прокси для бесплатного аккаунта PythonAnywhere
-session = AiohttpSession(proxy="http://proxy.server:3128")
+# Список Telegram ID администраторов (замени на свои)
+ADMIN_IDS = [8360192232, 5513038018, 7872590546]
 
+session = AiohttpSession(proxy="http://proxy.server:3128")
 bot = Bot(token=TOKEN, session=session)
 dp = Dispatcher(storage=MemoryStorage())
 
-CLOSE_HOUR = 17
-CLOSE_MINUTE = 30
-
+CLOSE_HOUR = 12
+CLOSE_MINUTE = 20
 PLATOONS = ["ВТ-31", "ВТ-32", "ВТ-41", "ВТ-42"]
 
 class Registration(StatesGroup):
@@ -49,6 +47,14 @@ CREATE TABLE IF NOT EXISTS entries (
     UNIQUE(date, user_id)
 )
 """)
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS active_list (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    chat_id INTEGER,
+    message_id INTEGER
+)
+""")
 conn.commit()
 
 
@@ -56,6 +62,10 @@ def is_registration_open() -> bool:
     now = datetime.now()
     close_time = now.replace(hour=CLOSE_HOUR, minute=CLOSE_MINUTE, second=0, microsecond=0)
     return now < close_time
+
+
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
 
 
 def get_list_text(today_str: str) -> str:
@@ -82,15 +92,13 @@ def get_list_text(today_str: str) -> str:
             slots[slot][platoon].append(name)
             
     status_note = "🟢 **Запись открыта** (до 17:30)" if is_registration_open() else "🔴 **Запись закрыта**"
-    
     text = f"📋 **Увольняемые на {today_str}**\n{status_note}\n\n"
     
     for slot_time, platoons_data in slots.items():
         text += f"⏰ **{slot_time}**\n"
         if platoons_data:
             for plt, names in platoons_data.items():
-                text += f"*{plt}:*\n"
-                text += "\n".join(f"• {name}" for name in names) + "\n"
+                text += f"*{plt}:*\n" + "\n".join(f"• {name}" for name in names) + "\n"
             text += "\n"
         else:
             text += "—\n\n"
@@ -98,7 +106,14 @@ def get_list_text(today_str: str) -> str:
     return text.strip()
 
 
-def get_keyboard():
+async def get_group_keyboard():
+    bot_info = await bot.get_me()
+    builder = InlineKeyboardBuilder()
+    builder.button(text="📝 Записаться / Выписаться", url=f"https://t.me/{bot_info.username}?start=signup")
+    return builder.as_markup()
+
+
+def get_private_keyboard():
     builder = InlineKeyboardBuilder()
     builder.button(text="18:30-21:30", callback_data="slot_1830_2130")
     builder.button(text="18:30-7:00", callback_data="slot_1830_0700")
@@ -117,33 +132,95 @@ def get_platoon_keyboard(prefix: str = "plt_"):
     return builder.as_markup()
 
 
+async def delete_messages_later(*messages: types.Message, delay: int = 4):
+    await asyncio.sleep(delay)
+    for msg in messages:
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+
+
+async def update_main_list():
+    cursor.execute("SELECT chat_id, message_id FROM active_list WHERE id = 1")
+    record = cursor.fetchone()
+    if record:
+        chat_id, message_id = record
+        today = datetime.now().strftime("%Y-%m-%d")
+        try:
+            await bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=get_list_text(today),
+                reply_markup=await get_group_keyboard(),
+                parse_mode="Markdown"
+            )
+        except Exception:
+            pass
+
+
 @dp.message(Command("new_list"))
 async def cmd_new_list(message: types.Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ Данная команда доступна только администраторам.")
+        return
+
     today = datetime.now().strftime("%Y-%m-%d")
     
     three_days_ago = (datetime.now() - timedelta(days=3)).strftime("%Y-%m-%d")
     cursor.execute("DELETE FROM entries WHERE date < ?", (three_days_ago,))
     conn.commit()
     
-    await message.answer(get_list_text(today), reply_markup=get_keyboard(), parse_mode="Markdown")
+    msg = await message.answer(get_list_text(today), reply_markup=await get_group_keyboard(), parse_mode="Markdown")
+    
+    cursor.execute(
+        "INSERT INTO active_list (id, chat_id, message_id) VALUES (1, ?, ?) "
+        "ON CONFLICT(id) DO UPDATE SET chat_id=excluded.chat_id, message_id=excluded.message_id",
+        (msg.chat.id, msg.message_id)
+    )
+    conn.commit()
+
+
+@dp.message(Command("start"))
+async def cmd_start(message: types.Message, state: FSMContext):
+    if message.chat.type != "private":
+        return
+
+    await message.answer(
+        "Выберите временной слот для записи в список увольняемых:",
+        reply_markup=get_private_keyboard()
+    )
 
 
 @dp.message(Command("change_name", "name"))
 async def cmd_change_name(message: types.Message, state: FSMContext):
+    msg = await message.answer("Введите новое звание и ФИО (например: *С-т Лемешев Д Д*):", parse_mode="Markdown")
+    await state.update_data(prompt_msg_id=msg.message_id)
     await state.set_state(Registration.updating_name)
-    await message.answer("Введите новое звание и ФИО (например: *С-т Лемешев Д Д*):", parse_mode="Markdown")
 
 
 @dp.message(Registration.updating_name)
 async def process_update_name(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
     new_name = message.text.strip()
-    
     cursor.execute("UPDATE users SET military_name = ? WHERE user_id = ?", (new_name, user_id))
     conn.commit()
     
+    data = await state.get_data()
+    prompt_msg_id = data.get("prompt_msg_id")
     await state.clear()
-    await message.answer(f"✅ ФИО обновлено: **{new_name}**", parse_mode="Markdown")
+    
+    confirm_msg = await message.answer(f"✅ ФИО обновлено: **{new_name}**", parse_mode="Markdown")
+    await update_main_list()
+    
+    to_delete = [message, confirm_msg]
+    if prompt_msg_id:
+        try:
+            prompt_msg = await bot.get_message(message.chat.id, prompt_msg_id)
+            to_delete.append(prompt_msg)
+        except Exception:
+            pass
+    asyncio.create_task(delete_messages_later(*to_delete, delay=4))
 
 
 @dp.message(Command("change_platoon", "platoon"))
@@ -155,27 +232,32 @@ async def cmd_change_platoon(message: types.Message):
 async def process_change_platoon(callback: types.CallbackQuery):
     user_id = callback.from_user.id
     new_platoon = callback.data.split("_")[1]
-    
     cursor.execute("UPDATE users SET platoon = ? WHERE user_id = ?", (new_platoon, user_id))
     conn.commit()
-    
     await callback.message.edit_text(f"✅ Взвод изменен на: **{new_platoon}**", parse_mode="Markdown")
     await callback.answer()
+    await update_main_list()
 
 
 @dp.message(Command("export"))
 async def cmd_export(message: types.Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ Данная команда доступна только администраторам.")
+        return
+
     today = datetime.now().strftime("%Y-%m-%d")
     raw_text = get_list_text(today).replace("**", "").replace("*", "")
-    
     file_bytes = raw_text.encode('utf-8')
     input_file = types.BufferedInputFile(file_bytes, filename=f"Увольняемые_{today}.txt")
-    
     await message.answer_document(input_file, caption=f"📄 Список увольняемых на {today}")
 
 
 @dp.message(Command("remove"))
 async def cmd_remove_user(message: types.Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ Данная команда доступна только администраторам.")
+        return
+
     today = datetime.now().strftime("%Y-%m-%d")
     cursor.execute("""
         SELECT e.user_id, u.platoon, u.military_name, e.slot 
@@ -191,25 +273,24 @@ async def cmd_remove_user(message: types.Message):
 
     builder = InlineKeyboardBuilder()
     for uid, plt, name, slot in rows:
-        builder.button(
-            text=f"❌ {plt} {name} ({slot})", 
-            callback_data=f"admrm_{uid}"
-        )
+        builder.button(text=f"❌ {plt} {name} ({slot})", callback_data=f"admrm_{uid}")
     builder.adjust(1)
-    
     await message.answer("Выберите человека для удаления из списка:", reply_markup=builder.as_markup())
 
 
 @dp.callback_query(F.data.startswith("admrm_"))
 async def process_admin_remove(callback: types.CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("⛔ У вас нет прав админа.", show_alert=True)
+        return
+
     target_uid = int(callback.data.split("_")[1])
     today = datetime.now().strftime("%Y-%m-%d")
-    
     cursor.execute("DELETE FROM entries WHERE date = ? AND user_id = ?", (today, target_uid))
     conn.commit()
-    
     await callback.answer("Участник удален из списка.")
     await callback.message.edit_text("✅ Участник успешно удален из списка на сегодня.")
+    await update_main_list()
 
 
 @dp.callback_query(F.data.startswith("slot_"))
@@ -224,8 +305,9 @@ async def handle_slot(callback: types.CallbackQuery, state: FSMContext):
     if callback.data == "slot_cancel":
         cursor.execute("DELETE FROM entries WHERE date = ? AND user_id = ?", (today, user_id))
         conn.commit()
-        await callback.message.edit_text(get_list_text(today), reply_markup=get_keyboard(), parse_mode="Markdown")
+        await callback.message.edit_text("Вы выписались из списка.")
         await callback.answer("Вы выписались.")
+        await update_main_list()
         return
 
     slot_map = {
@@ -240,10 +322,10 @@ async def handle_slot(callback: types.CallbackQuery, state: FSMContext):
     user = cursor.fetchone()
 
     if not user:
-        await state.update_data(chosen_slot=chosen_slot, target_message_id=callback.message.message_id)
+        await state.update_data(chosen_slot=chosen_slot)
         await state.set_state(Registration.waiting_for_platoon)
         await callback.answer()
-        await callback.message.answer("Выберите ваш взвод:", reply_markup=get_platoon_keyboard())
+        await callback.message.edit_text("Выберите ваш взвод:", reply_markup=get_platoon_keyboard())
     else:
         cursor.execute(
             "INSERT INTO entries (date, user_id, slot) VALUES (?, ?, ?) "
@@ -251,8 +333,9 @@ async def handle_slot(callback: types.CallbackQuery, state: FSMContext):
             (today, user_id, chosen_slot)
         )
         conn.commit()
-        await callback.message.edit_text(get_list_text(today), reply_markup=get_keyboard(), parse_mode="Markdown")
+        await callback.message.edit_text(f"✅ Вы успешно записаны на **{chosen_slot}**!", parse_mode="Markdown")
         await callback.answer("Запись обновлена!")
+        await update_main_list()
 
 
 @dp.callback_query(Registration.waiting_for_platoon, F.data.startswith("plt_"))
@@ -260,7 +343,6 @@ async def process_platoon(callback: types.CallbackQuery, state: FSMContext):
     platoon = callback.data.split("_")[1]
     await state.update_data(platoon=platoon)
     await state.set_state(Registration.waiting_for_name)
-    
     await callback.message.edit_text(
         f"Взвод: **{platoon}**.\nТеперь введите звание и фамилию (например: *Ряд Лемешев Д Д*):", 
         parse_mode="Markdown"
@@ -290,18 +372,10 @@ async def process_name(message: types.Message, state: FSMContext):
     conn.commit()
 
     await state.clear()
-    await message.answer("✅ Регистрация завершена. Вы внесены в список!")
+    confirm_msg = await message.answer("✅ Регистрация завершена. Вы внесены в список!")
+    await update_main_list()
 
-    try:
-        await bot.edit_message_text(
-            chat_id=message.chat.id,
-            message_id=data.get("target_message_id"),
-            text=get_list_text(today),
-            reply_markup=get_keyboard(),
-            parse_mode="Markdown"
-        )
-    except Exception:
-        pass
+    asyncio.create_task(delete_messages_later(message, confirm_msg, delay=4))
 
 
 async def main():
